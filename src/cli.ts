@@ -4,19 +4,22 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import Database from "better-sqlite3";
 import { renderDashboard } from "./dashboard.js";
-import { BorrowDesk, initializeDatabase } from "./desk.js";
+import { BorrowDesk, initializeDatabase, migrateDatabase } from "./desk.js";
 import { BorrowDeskError, type ErrorCode } from "./errors.js";
 import { parseLoanId } from "./validation.js";
 
-const HELP = `BorrowDesk v0 - equipment lending desk
+const HELP = `BorrowDesk - equipment lending desk
 
 Usage:
   node dist/cli.js --db <path> <command> [arguments] [options]
 
 Commands:
-  init                               Create the database schema (safe to repeat)
+  init                               Create the current schema (safe to repeat; never migrates)
+  migrate                            Upgrade a v0 database to the current schema (atomic)
   add-item <item-id> <name>          Register an equipment item
   list-items                         List items with availability, ordered by id
+  hold <item-id>                     Place a maintenance hold on an item
+  release <item-id>                  Remove a maintenance hold from an item
   checkout <item-id> <borrower-id>   Lend an available item; prints the new loan
   return <loan-id>                   Close an active loan
   list-loans [--active]              Loan history ordered by loan id (--active: open loans only)
@@ -26,6 +29,10 @@ Commands:
 Options:
   --db <path>   SQLite database file (required). Only init creates it.
   -h, --help    Show this help
+
+A held item cannot be checked out; holds and loans are independent, so an item
+can be held while it is on loan. Ordinary commands refuse a v0 database with
+MIGRATION_REQUIRED; run migrate first.
 
 Identifiers are 1-64 characters of lowercase letters, digits, "-", "_" or ".",
 starting with a letter or digit (e.g. drill-01, member-001). Names containing
@@ -42,8 +49,11 @@ interface CommandSpec {
 
 const COMMANDS: Record<string, CommandSpec> = {
   init: { args: [], options: [] },
+  migrate: { args: [], options: [] },
   "add-item": { args: ["item-id", "name"], options: [] },
   "list-items": { args: [], options: [] },
+  hold: { args: ["item-id"], options: [] },
+  release: { args: ["item-id"], options: [] },
   checkout: { args: ["item-id", "borrower-id"], options: [] },
   return: { args: ["loan-id"], options: [] },
   "list-loans": { args: [], options: ["active"] },
@@ -110,6 +120,7 @@ function parse(argv: string[], onCommand: (command: string) => void): ParsedComm
 
 function execute(parsed: ParsedCommand): unknown {
   if (parsed.command === "init") return initializeDatabase(parsed.db);
+  if (parsed.command === "migrate") return migrateDatabase(parsed.db);
 
   const desk = BorrowDesk.open(parsed.db);
   try {
@@ -119,6 +130,10 @@ function execute(parsed: ParsedCommand): unknown {
         return { item: desk.registerItem(first, second) };
       case "list-items":
         return { items: desk.listItems() };
+      case "hold":
+        return desk.hold(first);
+      case "release":
+        return desk.release(first);
       case "checkout":
         return { loan: desk.checkout(first, second) };
       case "return":
@@ -173,6 +188,8 @@ function writeReport(desk: BorrowDesk, db: string, out: string, force: boolean) 
     itemCount: snapshot.items.length,
     loanCount: snapshot.loans.length,
     activeLoanCount: snapshot.loans.filter((loan) => loan.status === "active").length,
+    heldItemCount: snapshot.items.filter((item) => item.held).length,
+    availableItemCount: snapshot.items.filter((item) => item.available).length,
   };
 }
 

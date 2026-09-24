@@ -71,10 +71,12 @@ describe("CLI lending workflow", () => {
     const { db, cli } = cliFor(t, false);
 
     const init = expectOk(cli("init"), "init");
-    assert.deepEqual(init, { database: db, schemaVersion: 1, alreadyInitialized: false });
+    assert.deepEqual(init, { database: db, schemaVersion: 2, alreadyInitialized: false, migrationRequired: false });
 
     const added = expectOk(cli("add-item", "drill-01", "Cordless drill"), "add-item");
-    assert.deepEqual(added, { item: { id: "drill-01", name: "Cordless drill", status: "available", activeLoan: null } });
+    assert.deepEqual(added, {
+      item: { id: "drill-01", name: "Cordless drill", status: "available", activeLoan: null, held: false, available: true },
+    });
     expectOk(cli("add-item", "camera-01", "Mirrorless camera"), "add-item");
 
     const { loan } = expectOk(cli("checkout", "drill-01", "member-001"), "checkout");
@@ -201,7 +203,15 @@ describe("CLI report command", () => {
     const report = expectOk(cli("report", "--out", out), "report");
     assert.deepEqual(
       { ...report, generatedAt: "" },
-      { path: out, generatedAt: "", itemCount: 1, loanCount: 1, activeLoanCount: 1 },
+      {
+        path: out,
+        generatedAt: "",
+        itemCount: 1,
+        loanCount: 1,
+        activeLoanCount: 1,
+        heldItemCount: 0,
+        availableItemCount: 0,
+      },
     );
     assert.match(report.generatedAt, ISO_UTC);
     const firstHtml = fs.readFileSync(out, "utf8");
@@ -219,5 +229,50 @@ describe("CLI report command", () => {
     expectError(cli("report", "--out", dir), 2, "INVALID_OUTPUT_PATH");
     expectError(cli("report", "--out", path.join(dir, "missing", "r.html")), 2, "INVALID_OUTPUT_PATH");
     assert.equal(fileHash(db), dbHash);
+  });
+});
+
+describe("CLI maintenance holds", () => {
+  test("hold and release return the item and changed flag; checkout of a held item is ITEM_HELD", (t) => {
+    const { cli } = cliFor(t);
+    expectOk(cli("add-item", "drill-01", "Cordless drill"), "add-item");
+
+    const held = expectOk(cli("hold", "drill-01"), "hold");
+    assert.equal(held.changed, true);
+    assert.deepEqual(held.item, {
+      id: "drill-01",
+      name: "Cordless drill",
+      status: "available",
+      activeLoan: null,
+      held: true,
+      available: false,
+    });
+
+    const again = expectOk(cli("hold", "drill-01"), "hold");
+    assert.equal(again.changed, false);
+    assert.deepEqual(again.item, held.item);
+
+    expectError(cli("checkout", "drill-01", "member-001"), 2, "ITEM_HELD");
+    expectError(cli("hold", "saw-01"), 2, "ITEM_NOT_FOUND");
+    expectError(cli("release", "saw-01"), 2, "ITEM_NOT_FOUND");
+
+    const released = expectOk(cli("release", "drill-01"), "release");
+    assert.equal(released.changed, true);
+    assert.equal(released.item.held, false);
+    assert.equal(released.item.available, true);
+    assert.equal(expectOk(cli("release", "drill-01"), "release").changed, false);
+
+    const loan = expectOk(cli("checkout", "drill-01", "member-001"), "checkout").loan;
+    assert.equal(loan.itemId, "drill-01");
+  });
+
+  test("hold validates like other item commands", (t) => {
+    const { cli } = cliFor(t);
+    expectOk(cli("add-item", "drill-01", "Cordless drill"), "add-item");
+    expectError(cli("hold"), 2, "INVALID_ARGUMENTS");
+    expectError(cli("hold", "drill-01", "extra"), 2, "INVALID_ARGUMENTS");
+    expectError(cli("hold", "--active", "drill-01"), 2, "INVALID_ARGUMENTS");
+    expectError(cli("hold", "Drill-01"), 2, "INVALID_INPUT");
+    expectOk(cli("release", "--", "drill-01"), "release");
   });
 });

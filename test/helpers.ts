@@ -5,7 +5,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { TestContext } from "node:test";
-import { BorrowDesk, initializeDatabase, type OpenOptions } from "../src/desk.js";
+import Database from "better-sqlite3";
+import {
+  APPLICATION_ID,
+  BorrowDesk,
+  V0_SCHEMA_VERSION,
+  initializeDatabase,
+  type OpenOptions,
+} from "../src/desk.js";
 import { BorrowDeskError, type ErrorCode } from "../src/errors.js";
 
 // Compiled helpers live in dist-test/test/, so the repository root is two levels up.
@@ -103,4 +110,86 @@ export function expectError(result: CliResult, exitCode: 1 | 2, code: string): a
   assert.equal(body.error.code, code);
   assert.equal(typeof body.error.message, "string");
   return body.error;
+}
+
+/**
+ * The exact v0 DDL documented in docs/behavior-v0.md, "Database schema
+ * (version 1)". Compatibility fixtures are built in process from this, because
+ * the current release's `init` creates version 2.
+ */
+export const V0_SCHEMA_SQL = `
+CREATE TABLE items (
+  id   TEXT PRIMARY KEY NOT NULL CHECK (length(id) BETWEEN 1 AND 64),
+  name TEXT NOT NULL CHECK (length(name) > 0)
+) STRICT;
+
+CREATE TABLE loans (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id        TEXT NOT NULL REFERENCES items (id),
+  borrower_id    TEXT NOT NULL CHECK (length(borrower_id) BETWEEN 1 AND 64),
+  checked_out_at TEXT NOT NULL,
+  returned_at    TEXT
+) STRICT;
+
+CREATE UNIQUE INDEX loans_one_active_per_item ON loans (item_id) WHERE returned_at IS NULL;
+`;
+
+export interface V0Seed {
+  items: { id: string; name: string }[];
+  loans?: { id: number; itemId: string; borrowerId: string; checkedOutAt: string; returnedAt: string | null }[];
+}
+
+/** Builds a populated v0 database in process, exactly as the v0 release stored it. */
+export function createV0Database(file: string, seed: V0Seed): void {
+  const db = new Database(file);
+  try {
+    db.exec(V0_SCHEMA_SQL);
+    db.pragma(`application_id = ${APPLICATION_ID}`);
+    db.pragma(`user_version = ${V0_SCHEMA_VERSION}`);
+    const insertItem = db.prepare("INSERT INTO items (id, name) VALUES (?, ?)");
+    for (const item of seed.items) insertItem.run(item.id, item.name);
+    const insertLoan = db.prepare(
+      "INSERT INTO loans (id, item_id, borrower_id, checked_out_at, returned_at) VALUES (?, ?, ?, ?, ?)",
+    );
+    for (const loan of seed.loans ?? []) {
+      insertLoan.run(loan.id, loan.itemId, loan.borrowerId, loan.checkedOutAt, loan.returnedAt);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+export interface RawSnapshot {
+  applicationId: number;
+  userVersion: number;
+  schema: { type: string; name: string; sql: string | null }[];
+  items: { id: string; name: string }[];
+  loans: { id: number; item_id: string; borrower_id: string; checked_out_at: string; returned_at: string | null }[];
+  /** Hold rows, or null when the v2 `holds` table does not exist. */
+  holds: { item_id: string; held_at: string }[] | null;
+}
+
+/** A logical snapshot of a database, used to prove migration atomicity. */
+export function rawSnapshot(file: string): RawSnapshot {
+  const db = new Database(file, { readonly: true });
+  try {
+    const schema = db
+      .prepare("SELECT type, name, sql FROM sqlite_schema ORDER BY name")
+      .all() as { type: string; name: string; sql: string | null }[];
+    const hasHolds = schema.some((entry) => entry.name === "holds");
+    return {
+      applicationId: db.pragma("application_id", { simple: true }) as number,
+      userVersion: db.pragma("user_version", { simple: true }) as number,
+      schema,
+      items: db.prepare("SELECT id, name FROM items ORDER BY id").all() as { id: string; name: string }[],
+      loans: db
+        .prepare("SELECT id, item_id, borrower_id, checked_out_at, returned_at FROM loans ORDER BY id")
+        .all() as RawSnapshot["loans"],
+      holds: hasHolds
+        ? (db.prepare("SELECT item_id, held_at FROM holds ORDER BY item_id").all() as RawSnapshot["holds"])
+        : null,
+    };
+  } finally {
+    db.close();
+  }
 }

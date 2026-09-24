@@ -92,3 +92,29 @@ test("concurrent CLI checkouts: one succeeds, the rest are rejected with ITEM_UN
   const loans = expectOk(await runCliAsync(["--db", db, "list-loans", "--active"]), "list-loans").loans;
   assert.equal(loans.length, 1);
 });
+
+test("concurrent checkouts of a held item all fail with ITEM_HELD and create no loans", { timeout: 30_000 }, async (t) => {
+  const db = path.join(tempDir(t), "held-race.db");
+  initializeDatabase(db);
+  const setup = BorrowDesk.open(db);
+  setup.registerItem("drill-01", "Drill");
+  setup.hold("drill-01");
+  setup.close();
+
+  const workers = Array.from({ length: WORKERS }, (_, i) => startWorker(db, "drill-01", `member-00${i}`));
+  t.after(() => workers.forEach((worker) => worker.child.kill()));
+
+  await Promise.all(workers.map((worker) => worker.ready));
+  for (const worker of workers) worker.child.stdin.write("go\n");
+  const outcomes = await Promise.all(workers.map((worker) => worker.outcome));
+
+  assert.deepEqual(
+    outcomes.map((outcome) => outcome.code),
+    Array(WORKERS).fill("ITEM_HELD"),
+    JSON.stringify(outcomes),
+  );
+  const desk = BorrowDesk.open(db);
+  t.after(() => desk.close());
+  assert.deepEqual(desk.listLoans(), []);
+  assert.equal(desk.listItems()[0]?.held, true);
+});
