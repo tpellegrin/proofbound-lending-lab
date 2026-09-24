@@ -2,21 +2,26 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
 import { test } from "node:test";
-import { BorrowDesk, initializeDatabase } from "../src/desk.js";
+import { BorrowDesk, initializeDatabase, type Item } from "../src/desk.js";
 import { expectError, expectOk, runCliAsync, tempDir } from "./helpers.js";
 
 const WORKER = path.join(import.meta.dirname, "checkout-worker.js");
+const HOLD_WORKER = path.join(import.meta.dirname, "hold-worker.js");
 const WORKERS = 8;
 const ROUNDS = 3;
 
 interface Worker {
   child: ChildProcessWithoutNullStreams;
   ready: Promise<void>;
-  outcome: Promise<{ ok: boolean; loanId?: number; code?: string }>;
+  outcome: Promise<{ ok: boolean; loanId?: number; code?: string; changed?: boolean; item?: Item }>;
 }
 
 function startWorker(db: string, itemId: string, borrowerId: string): Worker {
-  const child = spawn(process.execPath, [WORKER, db, itemId, borrowerId]);
+  return spawnWorker([WORKER, db, itemId, borrowerId]);
+}
+
+function spawnWorker(argv: string[]): Worker {
+  const child = spawn(process.execPath, argv);
   let stdout = "";
   let stderr = "";
   let markReady: () => void = () => {};
@@ -26,7 +31,7 @@ function startWorker(db: string, itemId: string, borrowerId: string): Worker {
     if (stdout.startsWith("ready\n")) markReady();
   });
   child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
-  const outcome = new Promise<{ ok: boolean; loanId?: number; code?: string }>((resolve, reject) => {
+  const outcome = new Promise<Awaited<Worker["outcome"]>>((resolve, reject) => {
     child.on("error", reject);
     child.on("close", (status) => {
       const lines = stdout.trim().split("\n");
@@ -117,4 +122,60 @@ test("concurrent checkouts of a held item all fail with ITEM_HELD and create no 
   t.after(() => desk.close());
   assert.deepEqual(desk.listLoans(), []);
   assert.equal(desk.listItems()[0]?.held, true);
+});
+
+test("a hold racing checkouts from separate processes: either order is valid, a loan never follows a hold", { timeout: 60_000 }, async (t) => {
+  // Hold-first: every checkout is ITEM_HELD and no loan exists. Checkout-first: exactly one loan, the
+  // other checkouts are ITEM_UNAVAILABLE, and the hold still succeeds, leaving the item held and
+  // borrowed. Final state alone cannot tell a checkout that slipped past a committed hold from the
+  // second order, so the witness is the item the hold read inside its own write transaction.
+  const CHECKOUTS = 3;
+  const db = path.join(tempDir(t), "hold-race.db");
+  initializeDatabase(db);
+  const setup = BorrowDesk.open(db);
+  for (let round = 0; round < ROUNDS * 2; round++) setup.registerItem(`saw-0${round}`, `Saw ${round}`);
+  setup.close();
+
+  const orders = { holdFirst: 0, checkoutFirst: 0 };
+  for (let round = 0; round < ROUNDS * 2; round++) {
+    const itemId = `saw-0${round}`;
+    const workers = [
+      spawnWorker([HOLD_WORKER, db, itemId]),
+      ...Array.from({ length: CHECKOUTS }, (_, i) => startWorker(db, itemId, `member-00${i}`)),
+    ];
+    t.after(() => workers.forEach((worker) => worker.child.kill()));
+
+    await Promise.all(workers.map((worker) => worker.ready));
+    for (const worker of workers) worker.child.stdin.write("go\n");
+    const [hold, ...checkouts] = await Promise.all(workers.map((worker) => worker.outcome));
+    const context = JSON.stringify({ hold, checkouts });
+
+    assert.equal(hold?.ok, true, context);
+    assert.equal(hold?.changed, true, context);
+    const winners = checkouts.filter((outcome) => outcome.ok);
+    const witnessed = hold?.item?.activeLoan ?? null;
+    if (witnessed === null) {
+      orders.holdFirst++;
+      assert.deepEqual(checkouts.map((outcome) => outcome.code), Array(CHECKOUTS).fill("ITEM_HELD"), context);
+    } else {
+      orders.checkoutFirst++;
+      assert.equal(winners.length, 1, context);
+      assert.equal(witnessed.id, winners[0]?.loanId, context);
+      assert.deepEqual(
+        checkouts.filter((outcome) => !outcome.ok).map((outcome) => outcome.code),
+        Array(CHECKOUTS - 1).fill("ITEM_UNAVAILABLE"),
+        context,
+      );
+    }
+
+    const desk = BorrowDesk.open(db);
+    const item = desk.listItems().find((entry) => entry.id === itemId);
+    const loans = desk.listLoans().filter((loan) => loan.itemId === itemId);
+    desk.close();
+    assert.equal(item?.held, true, context);
+    assert.equal(item?.available, false, context);
+    assert.equal(item?.status, witnessed === null ? "available" : "on_loan", context);
+    assert.deepEqual(loans.map((loan) => loan.id), witnessed === null ? [] : [witnessed.id], context);
+  }
+  t.diagnostic(`orders observed: ${JSON.stringify(orders)}`);
 });
