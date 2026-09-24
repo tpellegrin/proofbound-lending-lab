@@ -24,6 +24,24 @@ npm run check   # type-check, clean build, full test suite
 
 Nothing after `npm ci` downloads packages: builds, tests, the CLI and the demo use only installed files.
 
+## Upgrading an existing v0 database
+
+A database created by the v0 release has schema version 1. Migrate it once, before running any other
+command on it:
+
+```sh
+node dist/cli.js --db "$DB" migrate
+```
+
+Until it is migrated, every ordinary command — including the read-only `list-items`, `list-loans` and
+`report` — refuses the file with `MIGRATION_REQUIRED` (exit 2) and leaves it unchanged. `init` never
+migrates, replaces or resets an existing database.
+
+`migrate` is atomic and preserves every record (ids, borrowers, timestamps and the complete loan
+history); migrated items start without a hold. It is safe to repeat: on a current database it succeeds
+and changes nothing. See "Initialization and migration" in
+[docs/behavior-v0.md](docs/behavior-v0.md#initialization-and-migration).
+
 ## Using the CLI
 
 Build once (`npm run build`), then run `node dist/cli.js --db <path> <command>`. Every command requires
@@ -35,11 +53,14 @@ node dist/cli.js --db "$DB" init
 node dist/cli.js --db "$DB" add-item drill-01 "Cordless drill"
 node dist/cli.js --db "$DB" add-item projector-01 "Portable projector"
 node dist/cli.js --db "$DB" list-items
+node dist/cli.js --db "$DB" hold drill-01                       # maintenance hold; blocks new checkouts
+node dist/cli.js --db "$DB" release drill-01                    # remove the hold
 node dist/cli.js --db "$DB" checkout drill-01 member-001      # prints the loan, including its id
 node dist/cli.js --db "$DB" list-loans --active
 node dist/cli.js --db "$DB" return 1                          # loan id from checkout
 node dist/cli.js --db "$DB" list-loans                        # full history, oldest first
 node dist/cli.js --db "$DB" report --out ./dashboard.html     # add --force to replace an existing file
+node dist/cli.js --db "$DB" migrate                           # upgrade a v0 database to schema version 2
 node dist/cli.js --help
 ```
 
@@ -114,4 +135,6 @@ not be committed.
 - Timestamps come from the local system clock; BorrowDesk does not guard against clock changes.
 - The dashboard is a static snapshot; regenerate it to see new data.
 - Databases are for local disks; SQLite locking over network file systems is not supported.
-- There are no schema migrations; this release opens only schema version 1.
+- The current release uses schema version 2. A v0 database must be upgraded with `migrate`; ordinary
+  commands refuse it with `MIGRATION_REQUIRED` rather than migrating silently (see
+  [Upgrading an existing v0 database](#upgrading-an-existing-v0-database)).

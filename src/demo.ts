@@ -68,13 +68,18 @@ function main(): void {
   console.log("\n# Lending the projector again creates a new loan; the returned one stays in history:");
   run(["checkout", "projector-01", "member-004"]);
 
-  const items = run(["list-items"]).data.items as { id: string; status: string }[];
+  console.log("\n# A maintenance hold blocks a new checkout until it is released:");
+  run(["hold", "microphone-01"]);
+  run(["checkout", "microphone-01", "member-005"], 2);
+  run(["release", "microphone-01"]);
+
+  const items = run(["list-items"]).data.items as { id: string; available: boolean; held: boolean; activeLoan: unknown }[];
   run(["list-loans", "--active"]);
   const loans = run(["list-loans"]).data.loans as { status: string }[];
   const reportResult = run(["report", "--out", report]).data;
 
-  const available = items.filter((item) => item.status === "available").map((item) => item.id);
-  const onLoan = items.filter((item) => item.status === "on_loan").map((item) => item.id);
+  const available = items.filter((item) => item.available).map((item) => item.id);
+  const onLoan = items.filter((item) => item.activeLoan !== null).map((item) => item.id);
   const returned = loans.filter((loan) => loan.status === "returned").length;
   if (available.length === 0 || onLoan.length === 0 || returned === 0 || returned === loans.length) {
     throw new Error("Demo did not reach the expected mix of available/borrowed items and active/returned loans");

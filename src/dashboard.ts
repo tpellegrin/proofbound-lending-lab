@@ -38,6 +38,9 @@ const STYLE = `
   .available { color: var(--ok); background: var(--ok-bg); }
   .on_loan, .active { color: var(--out); background: var(--out-bg); }
   .returned { color: var(--done); background: var(--done-bg); }
+  .held { color: #7a3e9d; background: #efe4f7; }
+  .unavailable { color: var(--muted); background: var(--done-bg); }
+  .summary-note { margin: 8px 2px 0; color: var(--muted); font-size: 13px; }
   .empty { color: var(--muted); padding: 12px; margin: 0; }
 `;
 
@@ -56,13 +59,17 @@ export function renderDashboard(snapshot: Snapshot, source: string): string {
   const { items, loans, generatedAt } = snapshot;
   const names = new Map(items.map((item) => [item.id, item.name]));
   const activeLoans = loans.filter((loan) => loan.status === "active");
-  const available = items.filter((item) => item.status === "available").length;
+  const available = items.filter((item) => item.available).length;
+  const borrowed = items.filter((item) => item.activeLoan !== null).length;
+  const held = items.filter((item) => item.held).length;
 
   const itemRows = items.map(
     (item) => `<tr>
         <td><code>${escapeHtml(item.id)}</code></td>
         <td class="name">${escapeHtml(item.name)}</td>
-        <td>${statusBadge(item.status)}</td>
+        <td>${item.activeLoan ? badge("Borrowed", "on_loan") : "—"}</td>
+        <td>${item.held ? badge("Held", "held") : "—"}</td>
+        <td>${item.available ? badge("Available", "available") : badge("Unavailable", "unavailable")}</td>
         <td>${item.activeLoan ? `<code>${escapeHtml(item.activeLoan.borrowerId)}</code>` : "—"}</td>
         <td>${item.activeLoan ? `<code>${item.activeLoan.id}</code>` : "—"}</td>
         <td>${item.activeLoan ? escapeHtml(item.activeLoan.checkedOutAt) : "—"}</td>
@@ -97,12 +104,15 @@ export function renderDashboard(snapshot: Snapshot, source: string): string {
   <ul class="summary">
     <li><b>${items.length}</b> items registered</li>
     <li><b>${available}</b> available</li>
-    <li><b>${items.length - available}</b> on loan</li>
+    <li><b>${borrowed}</b> on loan</li>
+    <li><b>${held}</b> held</li>
     <li><b>${loans.length}</b> loans recorded</li>
   </ul>
+  <p class="summary-note">Availability, loans and holds are separate facts and may overlap: an item can be
+    on loan and held at once, so available + on loan + held need not equal the item count.</p>
 
   <h2>Equipment</h2>
-  ${table(["Item", "Name", "Status", "Borrower", "Loan", "Checked out (UTC)"], itemRows, "No equipment registered.")}
+  ${table(["Item", "Name", "Borrowed", "Held", "Available", "Borrower", "Loan", "Checked out (UTC)"], itemRows, "No equipment registered.")}
 
   <h2>Active loans</h2>
   ${table(["Loan", "Item", "Name", "Borrower", "Checked out (UTC)"], activeLoans.map((loan) => loanRow(loan, false)), "No active loans.")}
@@ -116,7 +126,11 @@ export function renderDashboard(snapshot: Snapshot, source: string): string {
 }
 
 function statusBadge(status: Item["status"] | Loan["status"]): string {
-  return `<span class="status ${status}">${STATUS_LABELS[status]}</span>`;
+  return badge(STATUS_LABELS[status], status);
+}
+
+function badge(text: string, className: string): string {
+  return `<span class="status ${className}">${text}</span>`;
 }
 
 function table(headings: string[], rows: string[], emptyText: string): string {

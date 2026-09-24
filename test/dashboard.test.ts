@@ -62,9 +62,16 @@ test("dashboard reflects stored state, escapes names, and is self-contained", (t
   assert.deepEqual(
     tableRows(html, "Equipment").map(decode),
     items.map((item) =>
-      item.activeLoan
-        ? `${item.id} ${item.name} ${label[item.status]} ${item.activeLoan.borrowerId} ${item.activeLoan.id} ${item.activeLoan.checkedOutAt}`
-        : `${item.id} ${item.name} ${label[item.status]} — — —`,
+      [
+        item.id,
+        item.name,
+        item.activeLoan ? "Borrowed" : "—",
+        item.held ? "Held" : "—",
+        item.available ? "Available" : "Unavailable",
+        item.activeLoan ? item.activeLoan.borrowerId : "—",
+        item.activeLoan ? String(item.activeLoan.id) : "—",
+        item.activeLoan ? item.activeLoan.checkedOutAt : "—",
+      ].join(" "),
     ),
   );
   assert.deepEqual(
@@ -94,4 +101,48 @@ test("dashboard for an empty database says so", (t) => {
   assert.match(html, /No equipment registered\./);
   assert.match(html, /No active loans\./);
   assert.match(html, /No loans recorded\./);
+});
+
+test("dashboard reports borrowed, held and available separately, allowing overlap", (t) => {
+  const dir = tempDir(t);
+  const db = path.join(dir, "holds.db");
+  const cli = (...args: string[]) => runCli(["--db", db, ...args]);
+  expectOk(cli("init"), "init");
+  expectOk(cli("add-item", "camera-01", "Mirrorless camera"), "add-item");
+  expectOk(cli("add-item", "drill-01", "Cordless drill"), "add-item");
+  expectOk(cli("add-item", "saw-01", "Circular saw"), "add-item");
+  expectOk(cli("hold", "camera-01"), "hold");
+  const loan = expectOk(cli("checkout", "drill-01", "member-001"), "checkout").loan;
+  expectOk(cli("hold", "drill-01"), "hold");
+
+  const out = path.join(dir, "holds.html");
+  const report = expectOk(cli("report", "--out", out), "report");
+  const html = fs.readFileSync(out, "utf8");
+
+  assert.deepEqual(
+    { ...report, generatedAt: "" },
+    {
+      path: out,
+      generatedAt: "",
+      itemCount: 3,
+      loanCount: 1,
+      activeLoanCount: 1,
+      heldItemCount: 2,
+      availableItemCount: 1,
+    },
+  );
+
+  const rows = tableRows(html, "Equipment").map(decode);
+  assert.deepEqual([rows[0], rows[2]], [
+    "camera-01 Mirrorless camera — Held Unavailable — — —",
+    "saw-01 Circular saw — — Available — — —",
+  ]);
+  assert.match(
+    rows[1] as string,
+    new RegExp(
+      `^drill-01 Cordless drill Borrowed Held Unavailable member-001 ${loan.id} ` +
+        `${loan.checkedOutAt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+    ),
+  );
+  assert.match(html, /available \+ on loan \+ held need not equal the item count/);
 });

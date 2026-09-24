@@ -10,7 +10,14 @@ describe("equipment registration", () => {
   test("registers an item as available", (t) => {
     const { desk } = newDesk(t);
     const item = desk.registerItem("drill-01", "Cordless drill");
-    assert.deepEqual(item, { id: "drill-01", name: "Cordless drill", status: "available", activeLoan: null });
+    assert.deepEqual(item, {
+      id: "drill-01",
+      name: "Cordless drill",
+      status: "available",
+      activeLoan: null,
+      held: false,
+      available: true,
+    });
     assert.deepEqual(desk.listItems(), [item]);
   });
 
@@ -49,6 +56,8 @@ describe("checkout and return", () => {
       name: "Portable projector",
       status: "on_loan",
       activeLoan: { id: loan.id, borrowerId: "member-001", checkedOutAt: "2026-03-01T09:00:00.000Z" },
+      held: false,
+      available: false,
     });
   });
 
@@ -236,7 +245,12 @@ describe("persistence and initialization", () => {
     const state = domainState(desk);
 
     const result = initializeDatabase(file);
-    assert.deepEqual(result, { database: path.resolve(file), schemaVersion: SCHEMA_VERSION, alreadyInitialized: true });
+    assert.deepEqual(result, {
+      database: path.resolve(file),
+      schemaVersion: SCHEMA_VERSION,
+      alreadyInitialized: true,
+      migrationRequired: false,
+    });
     assert.deepEqual(domainState(desk), state);
   });
 

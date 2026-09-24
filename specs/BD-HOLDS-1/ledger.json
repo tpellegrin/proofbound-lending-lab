@@ -1,0 +1,16 @@
+{
+  "artifact_identity": "proofbound-artifact-text-v1",
+  "artifacts": {
+    "specs/BD-HOLDS-1/requirements.md": {
+      "content_sha256": "317efd0c47bdbdfc8d133563f14ac785ff9438b680a297a533bd18f9cc3b8c82",
+      "depends_on": {},
+      "review": {
+        "gate": "phases/design/tasks/requirements/attempts/spec-reflector-2/evidence-gate.json",
+        "gate_sha256": "1f7c165fa8b2a1cc07c04266ea650adb264add6fb0763187cc7f3b18c5c5a74d",
+        "purpose": "proposal-reflection",
+        "role": "spec-reflector"
+      }
+    }
+  },
+  "format": "proofbound-change-ledger-v1"
+}

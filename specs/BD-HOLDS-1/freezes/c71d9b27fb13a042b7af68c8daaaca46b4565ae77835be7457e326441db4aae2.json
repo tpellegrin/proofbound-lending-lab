@@ -1,0 +1,10 @@
+{
+  "artifacts": {
+    "specs/BD-HOLDS-1/requirements.md": {
+      "content_sha256": "317efd0c47bdbdfc8d133563f14ac785ff9438b680a297a533bd18f9cc3b8c82",
+      "depends_on": {},
+      "review_purpose": "proposal-reflection"
+    }
+  },
+  "format": "proofbound-freeze-v1"
+}
