@@ -42,6 +42,9 @@ history); migrated items start without a hold. It is safe to repeat: on a curren
 and changes nothing. See "Initialization and migration" in
 [docs/behavior-v0.md](docs/behavior-v0.md#initialization-and-migration).
 
+Migration is one-way: the v0 release refuses a migrated file with `UNSUPPORTED_SCHEMA_VERSION`. Keep a
+copy of the file from before migrating if you may need to go back to v0.
+
 ## Using the CLI
 
 Build once (`npm run build`), then run `node dist/cli.js --db <path> <command>`. Every command requires
