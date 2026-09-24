@@ -1,0 +1,31 @@
+{
+  "name": "borrowdesk",
+  "version": "0.1.0",
+  "description": "Small command-line equipment lending desk for a community workshop.",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "clean": "node -e \"for (const d of ['dist', 'dist-test']) require('node:fs').rmSync(d, { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "build:test": "tsc -p tsconfig.test.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "npm run build && npm run build:test && node --test --test-timeout=60000 \"dist-test/test/**/*.test.js\"",
+    "check": "npm run typecheck && npm test",
+    "demo": "npm run build && node dist/demo.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "24.13.6",
+    "typescript": "7.0.2"
+  },
+  "allowScripts": {
+    "better-sqlite3@13.0.3": true
+  }
+}
