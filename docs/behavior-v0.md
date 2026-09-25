@@ -2,7 +2,7 @@
 
 This is the behavior contract for BorrowDesk. It documents the **current release** (schema version 2:
 maintenance holds plus an explicit migration path from v0) and preserves the **v0** rules and schema
-that later releases must keep readable. Sections marked "version 1" describe the frozen v0 release
+that later releases must keep migratable. Sections marked "version 1" describe the frozen v0 release
 (commit `63da90eb`); everything else describes the current release.
 
 ## Domain rules

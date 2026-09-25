@@ -8,7 +8,9 @@
 - Lending rules live in `src/desk.ts` and validation in `src/validation.ts`; the CLI and dashboard only
   call into them. Keep business rules out of `src/cli.ts` and `src/dashboard.ts`.
 - `docs/behavior-v0.md` is the behavior contract (rules, CLI syntax, JSON, error codes, schema). Update it
-  with any intentional behavior change, and keep existing v0 databases readable.
+  with any intentional behavior change. Keep existing v0 databases migratable by `migrate` without loss;
+  ordinary commands refuse them with `MIGRATION_REQUIRED`, by the owner's decision in BD-HOLDS-1
+  (`specs/BD-HOLDS-1/README.md`).
 - Tests must use temporary databases, stay deterministic (inject a clock; never sleep to separate
   timestamps), and clean up only what they create.
 - Never commit databases, `dist/`, `dist-test/`, `demo-output/` or generated reports.
