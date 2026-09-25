@@ -1,0 +1,16 @@
+{
+  "artifact_identity": "proofbound-artifact-text-v1",
+  "artifacts": {
+    "specs/BD-MIGRATION-BACKUP-1/requirements.md": {
+      "content_sha256": "08fb357f244a0bfd491ca19c8219806d2f66acfff4c72b1085067e0bf3950eef",
+      "depends_on": {},
+      "review": {
+        "gate": "phases/design/tasks/requirements/attempts/spec-reflector-2/evidence-gate.json",
+        "gate_sha256": "b4ea9c1a7c14b6c2d5deaa876cea387977ca57ec71666ec0f884e5e2908b4938",
+        "purpose": "proposal-reflection",
+        "role": "spec-reflector"
+      }
+    }
+  },
+  "format": "proofbound-change-ledger-v1"
+}

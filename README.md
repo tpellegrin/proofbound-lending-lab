@@ -42,8 +42,28 @@ history); migrated items start without a hold. It is safe to repeat: on a curren
 and changes nothing. See "Initialization and migration" in
 [docs/behavior-v0.md](docs/behavior-v0.md#initialization-and-migration).
 
-Migration is one-way: the v0 release refuses a migrated file with `UNSUPPORTED_SCHEMA_VERSION`. Keep a
-copy of the file from before migrating if you may need to go back to v0.
+### Keep a pre-migration backup
+
+`migrate` does **not** create a backup unless you ask for one. Pass `--backup <new-file>` to have it
+publish a verified v0 copy of the database *before* the migration commits:
+
+```sh
+node dist/cli.js --db "$DB" migrate --backup "$DB.v0-backup"
+```
+
+The backup is checked with a fresh read-only connection (pragmas, schema, rows, loan-id allocation
+state) before it appears at the destination, and the migration and the snapshot are coordinated under
+one write lock, so a concurrent write is either in both files or in neither. An existing destination is
+never overwritten; partial work uses a documented `<name>.<hex>.tmp` temporary file and is cleaned up on
+a handled failure. If the migration fails after the backup was published, the backup is kept and the
+error says so. On a database that is already current, `migrate --backup` succeeds without touching the
+destination.
+
+Migration is one-way: the v0 release refuses a migrated file with `UNSUPPORTED_SCHEMA_VERSION`. To go
+back to v0, **copy** the backup and open the copy with the old (v0) application. Later writes to the
+migrated database are not in the backup, and the backup is not immune to later modification, hardware
+failure or power loss. The full rules are in
+[docs/behavior-v0.md](docs/behavior-v0.md#pre-migration-backup-migrate---backup-path).
 
 ## Using the CLI
 
@@ -64,6 +84,7 @@ node dist/cli.js --db "$DB" return 1                          # loan id from che
 node dist/cli.js --db "$DB" list-loans                        # full history, oldest first
 node dist/cli.js --db "$DB" report --out ./dashboard.html     # add --force to replace an existing file
 node dist/cli.js --db "$DB" migrate                           # upgrade a v0 database to schema version 2
+node dist/cli.js --db "$DB" migrate --backup "$DB.v0"         # ...after publishing a verified v0 backup
 node dist/cli.js --help
 ```
 
@@ -141,3 +162,7 @@ not be committed.
 - The current release uses schema version 2. A v0 database must be upgraded with `migrate`; ordinary
   commands refuse it with `MIGRATION_REQUIRED` rather than migrating silently (see
   [Upgrading an existing v0 database](#upgrading-an-existing-v0-database)).
+- `migrate --backup`'s guard against naming a SQLite journal file compares exact strings. On a
+  case-insensitive file system a case variant of `<source>-journal`/`-wal`/`-shm` is not refused, and a
+  symlinked `--db` is compared as named rather than by its target. The source and the migration are
+  unaffected; only that backup can be lost, and both require naming a SQLite-internal journal path.
