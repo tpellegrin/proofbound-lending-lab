@@ -83,7 +83,7 @@ node dist/cli.js --db <path> <command> [arguments] [options]
 | Command | Result `data` |
 | --- | --- |
 | `init` | `{ "database": <absolute path>, "schemaVersion": <actual stored version>, "alreadyInitialized": <bool>, "migrationRequired": <bool> }` |
-| `migrate` | `{ "database": <absolute path>, "fromSchemaVersion": <n>, "schemaVersion": 2, "migrated": <bool> }` |
+| `migrate [--backup <path>]` | `{ "database": <absolute path>, "fromSchemaVersion": <n>, "schemaVersion": 2, "migrated": <bool> }`; with `--backup` also `"backup": { "path", "created", "verified", "schemaVersion": 1 }` or `"backup": null` |
 | `add-item <item-id> <name>` | `{ "item": Item }` |
 | `list-items` | `{ "items": [Item, ...] }` |
 | `hold <item-id>` | `{ "item": Item, "changed": <bool> }` |
@@ -98,6 +98,9 @@ node dist/cli.js --db <path> <command> [arguments] [options]
   `DATABASE_NOT_INITIALIZED` instead of creating anything. `migrate` never creates a file.
 - Options may appear anywhere; an option that does not apply to the command is rejected. Use `--`
   before positional arguments that begin with `-`.
+- `--backup <path>` is valid only for `migrate`; on any other command, or with a missing or empty
+  value, it is `INVALID_ARGUMENTS` (exit 2). Relative paths resolve against the working directory,
+  as `report --out` does.
 - `report` refuses an existing output file (`OUTPUT_EXISTS`) unless `--force` is given, and never
   writes over the database file.
 - `--help` / `-h` / `help` prints plain-text help to stdout and exits 0.
@@ -124,6 +127,67 @@ node dist/cli.js --db <path> <command> [arguments] [options]
   - a BorrowDesk database at a version this release does not know → `UNSUPPORTED_SCHEMA_VERSION`;
   - a BorrowDesk database that fails SQLite's integrity check → `DATABASE_CORRUPT` (exit 2, unchanged).
     `migrate` runs the integrity check before changing anything.
+
+### Pre-migration backup (`migrate --backup <path>`)
+
+`migrate --backup <path>` publishes a verified copy of the v0 database *before* the migration commits,
+then migrates as usual. Plain `migrate` does **not** create a backup; a backup exists only when
+`--backup` is given.
+
+- On a **v0** database, a successful run leaves at the destination a valid schema-version-1 file
+  (`application_id = 0x426F7244`, `user_version = 1`, the v0 `items`/`loans` tables, their constraints
+  and the partial unique index). The staged file is opened with a fresh read-only connection and checked
+  before it is published: its pragmas, schema objects (`items`, `loans`, `loans_one_active_per_item`,
+  `sqlite_sequence`) and every `items`, `loans` and `sqlite_sequence` row must equal the source's state
+  captured under the migration write lock. This preserves identifiers, timestamps and the loan-id
+  allocation state, so a new checkout on the backup allocates the next loan id the source would have.
+  The backup need not be byte-identical to the source.
+- The migration and the backup snapshot are coordinated: the operation takes the source's write lock
+  (`BEGIN IMMEDIATE`, the same 5 s busy timeout as every other writer) before the snapshot and holds it
+  through the snapshot, verification, publication and commit. A writer either commits before the
+  snapshot (its effect is in both files) or after the migration (it operates on version 2). If the lock
+  cannot be acquired within 5 s the invocation fails `DATABASE_BUSY` (exit 1) and creates nothing.
+- The backup is an independent file, not a hard link or symlink to the source: writing to either does
+  not change the other.
+- **Destination rules.** An existing destination is never overwritten, replaced, truncated or followed,
+  whatever its contents. For a v0 source the destination is validated before anything is created, and
+  every refusal is exit 2 with `field: "backup"`:
+  - the destination's parent directory must exist and be a directory, otherwise `INVALID_OUTPUT_PATH`;
+  - a destination that resolves to the source, or to one of the source's SQLite-owned names
+    `<source>-journal`, `<source>-wal` or `<source>-shm`, is `INVALID_OUTPUT_PATH` whether or not that
+    file exists;
+  - an existing directory at the destination is `INVALID_OUTPUT_PATH`; any other existing entry
+    (a regular file, an empty file, a symlink — including a dangling one — a hard link or a socket) is
+    `OUTPUT_EXISTS`.
+- **Publication and interruption.** Partial work is written to a temporary file in the destination's
+  directory named `<destination basename>.<at least 8 lowercase hex characters>.tmp`, created
+  exclusively (`O_EXCL`), written, `fsync`ed and closed. It is published by a no-clobber hard link to the
+  destination followed by removing the temporary name, so a concurrently created destination is not
+  overwritten (`OUTPUT_EXISTS`, exit 2). A handled failure removes the temporary files the invocation
+  created; a temporary file it cannot remove is reported as `error.leftover` (absolute path). An abrupt
+  process interruption may leave a `.tmp` file, which is not a valid backup and can be deleted.
+- **Output.** On success the usual fields are returned plus
+  `"backup": { "path": <absolute destination>, "created": true, "verified": true, "schemaVersion": 1 }`.
+  On a **version 2** source, `--backup` is an idempotent success (`migrated: false`) with
+  `"backup": null`; the destination is never examined or modified, so an old backup there is left
+  untouched and is not reported as a new one. Every failure after argument parsing carries
+  `error.backup`: `null` when nothing was published, or the published object when a valid backup was
+  published and kept because the migration then failed. That later case keeps the underlying code and
+  exit class and says the backup was kept and the migration was not committed; a retry naming the same
+  path refuses with `OUTPUT_EXISTS` until a new path is chosen or the retained backup is removed.
+- **Recovery.** To go back to v0, copy the backup and open the copy with the **old (v0) application**.
+  The current release refuses a v0 file with `MIGRATION_REQUIRED`, and the v0 release refuses the
+  migrated file. Later writes to the migrated database are **not** contained in the backup.
+- **Durability.** A completed backup is openable and matches the preservation claim above. It is not
+  immune to later external modification, hardware failure or power loss. After publication the
+  destination directory is `fsync`ed before the migration commits; that is a documented expectation of
+  this host's behavior, not something the tests observe.
+- **Known limitations of the destination guard.** The sibling-name check compares exact strings, so on
+  a case-insensitive file system a destination that is a case variant of
+  `<source>-journal`/`-wal`/`-shm` is not refused, and when `--db` is a symlink the check uses the name
+  as given rather than the link's target. In both cases the source and the migration are unaffected;
+  only that backup can be deleted by a later ordinary write to the source. Both require the operator to
+  name a SQLite-internal journal path.
 
 Shapes:
 
@@ -164,7 +228,10 @@ Failure: nothing on stdout, one JSON document on stderr, no stack trace.
 ```
 
 `command` is `null` when no valid command was recognized. `field` is present when a specific input is at
-fault (`itemId`, `borrowerId`, `name`, `loanId`, `out`). Messages are for people; match on `code`.
+fault (`itemId`, `borrowerId`, `name`, `loanId`, `out`, `backup`). Messages are for people; match on
+`code`. Every failure of a `migrate --backup` invocation after argument parsing also carries
+`error.backup` (`null`, or the published backup object when one was kept), and `error.leftover` (an
+absolute path) when a temporary file could not be removed.
 
 | Exit | Code | Meaning |
 | --- | --- | --- |
@@ -183,10 +250,11 @@ fault (`itemId`, `borrowerId`, `name`, `loanId`, `out`). Messages are for people
 | 2 | `ITEM_HELD` | `checkout` of a held item that has no active loan |
 | 2 | `LOAN_NOT_FOUND` | `return` of an unknown loan |
 | 2 | `LOAN_ALREADY_RETURNED` | `return` of a returned loan |
-| 2 | `OUTPUT_EXISTS` | `report` target exists and `--force` was not given |
-| 2 | `INVALID_OUTPUT_PATH` | `report` target is a directory, the database file, or its directory is missing |
+| 2 | `OUTPUT_EXISTS` | `report` target exists without `--force`, or a `migrate --backup` destination exists (or appeared during publication) |
+| 2 | `INVALID_OUTPUT_PATH` | `report` target is a directory, the database file, or its directory is missing; or a `migrate --backup` destination is a directory, aliases the source or one of its SQLite journal names, or its directory is missing |
 | 1 | `DATABASE_BUSY` | Another process held the database lock for more than 5 seconds |
 | 1 | `STORAGE_ERROR` | Any other SQLite failure (e.g. read-only file, disk full, corruption of an ordinary command) |
+| 1 | `BACKUP_FAILED` | `migrate --backup` could not create or verify the backup; the migration did not run and nothing was published |
 | 1 | `INTERNAL_ERROR` | Unexpected program error |
 
 ### Concurrency

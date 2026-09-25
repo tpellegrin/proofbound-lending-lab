@@ -1,7 +1,9 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
-import { BorrowDeskError } from "./errors.js";
+import { BorrowDeskError, annotateError } from "./errors.js";
 import { requireBorrowerId, requireItemId, requireItemName, requireLoanId } from "./validation.js";
 
 /** Schema version written by the current release (stored in SQLite's `user_version`). */
@@ -91,11 +93,24 @@ export interface InitResult {
   migrationRequired: boolean;
 }
 
+/** Where a `migrate --backup` invocation published its verified pre-migration v0 backup. */
+export interface BackupInfo {
+  path: string;
+  created: true;
+  verified: true;
+  schemaVersion: number;
+}
+
 export interface MigrateResult {
   database: string;
   fromSchemaVersion: number;
   schemaVersion: number;
   migrated: boolean;
+  /**
+   * Present only for a `migrate --backup` invocation: the published backup
+   * object, or `null` when no backup was created (v2 idempotent success).
+   */
+  backup?: BackupInfo | null;
 }
 
 export interface HoldResult {
@@ -115,6 +130,19 @@ export interface MigrateOptions {
    * whole transaction rolls back. Not used by the CLI.
    */
   onFirstSchemaChange?: () => void;
+  /**
+   * Destination for a pre-migration backup (`migrate --backup <path>`). When
+   * set, the backup semantics of this module apply. Resolved against the working
+   * directory, like `report --out`.
+   */
+  backup?: string;
+  /**
+   * Test-only fault seam. Called with the staged temporary backup path after the
+   * snapshot is written and before it is verified. Throwing forces a backup
+   * creation failure; mutating the file forces a verification failure; creating
+   * the destination forces the no-clobber publication race. Not used by the CLI.
+   */
+  onBackupStaged?: (temporaryPath: string) => void;
 }
 
 interface ItemRow {
@@ -223,36 +251,278 @@ export function migrateDatabase(file: string, options: MigrateOptions = {}): Mig
     }
     assertIntegrity(db, database);
     if (version === SCHEMA_VERSION) {
-      return { database, fromSchemaVersion: SCHEMA_VERSION, schemaVersion: SCHEMA_VERSION, migrated: false };
+      return withBackupField(
+        { database, fromSchemaVersion: SCHEMA_VERSION, schemaVersion: SCHEMA_VERSION, migrated: false },
+        options.backup,
+        null,
+      );
     }
-    // Re-read the version inside the write transaction: a migrate that loses a race
-    // to a concurrent migrate on the same file then sees the committed version 2 and
-    // becomes an idempotent no-op instead of trying to recreate the `holds` table.
-    const migrated = db
-      .transaction(() => {
-        const current = inspectForMigrate(db, database).version;
-        if (current === SCHEMA_VERSION) return false;
-        if (current !== V0_SCHEMA_VERSION) {
-          throw new BorrowDeskError(
-            "UNSUPPORTED_SCHEMA_VERSION",
-            `${database} has schema version ${current}; this release supports version ${SCHEMA_VERSION}`,
-          );
+    // A published backup outlives the transaction: if the schema change fails
+    // afterwards, the backup must be kept and reported (R5.2).
+    const state: { published: BackupInfo | null } = { published: null };
+    try {
+      // Re-read the version inside the write transaction: a migrate that loses a race
+      // to a concurrent migrate on the same file then sees the committed version 2 and
+      // becomes an idempotent no-op instead of trying to recreate the `holds` table.
+      const migrated = db
+        .transaction(() => {
+          const current = inspectForMigrate(db, database).version;
+          if (current === SCHEMA_VERSION) return false;
+          if (current !== V0_SCHEMA_VERSION) {
+            throw new BorrowDeskError(
+              "UNSUPPORTED_SCHEMA_VERSION",
+              `${database} has schema version ${current}; this release supports version ${SCHEMA_VERSION}`,
+            );
+          }
+          if (options.backup !== undefined) {
+            const destination = path.resolve(options.backup);
+            validateBackupDestination(database, destination);
+            state.published = createBackup(db, destination, options);
+          }
+          db.exec(HOLDS_TABLE_SQL);
+          options.onFirstSchemaChange?.();
+          db.pragma(`user_version = ${SCHEMA_VERSION}`);
+          return true;
+        })
+        .immediate();
+      return withBackupField(
+        {
+          database,
+          fromSchemaVersion: migrated ? V0_SCHEMA_VERSION : SCHEMA_VERSION,
+          schemaVersion: SCHEMA_VERSION,
+          migrated,
+        },
+        options.backup,
+        state.published,
+      );
+    } catch (error) {
+      if (options.backup !== undefined && state.published !== null) {
+        annotateError(error, { backup: state.published });
+        if (error instanceof Error) {
+          error.message = `${error.message} (the backup was kept at ${state.published.path}; the migration was not committed)`;
         }
-        db.exec(HOLDS_TABLE_SQL);
-        options.onFirstSchemaChange?.();
-        db.pragma(`user_version = ${SCHEMA_VERSION}`);
-        return true;
-      })
-      .immediate();
-    return {
-      database,
-      fromSchemaVersion: migrated ? V0_SCHEMA_VERSION : SCHEMA_VERSION,
-      schemaVersion: SCHEMA_VERSION,
-      migrated,
-    };
+      }
+      throw error;
+    }
   } finally {
     db.close();
   }
+}
+
+function withBackupField(
+  result: { database: string; fromSchemaVersion: number; schemaVersion: number; migrated: boolean },
+  backupRequested: string | undefined,
+  backup: BackupInfo | null,
+): MigrateResult {
+  return backupRequested === undefined ? result : { ...result, backup };
+}
+
+/**
+ * R4.2 destination validation for a v0 source. Order is parent directory, then
+ * resolved-path alias/sibling check, then `lstat`. Nothing is created.
+ */
+function validateBackupDestination(source: string, destination: string): void {
+  const parent = path.dirname(destination);
+  let parentStat: fs.Stats;
+  try {
+    parentStat = fs.statSync(parent);
+  } catch {
+    throw new BorrowDeskError("INVALID_OUTPUT_PATH", `Directory does not exist: ${parent}`, "backup");
+  }
+  if (!parentStat.isDirectory()) {
+    throw new BorrowDeskError("INVALID_OUTPUT_PATH", `Not a directory: ${parent}`, "backup");
+  }
+
+  const resolved = resolveForComparison(destination);
+  const forbidden = [source, `${source}-journal`, `${source}-wal`, `${source}-shm`].map(resolveForComparison);
+  if (forbidden.includes(resolved)) {
+    throw new BorrowDeskError(
+      "INVALID_OUTPUT_PATH",
+      `Backup path must not be the database file or one of its SQLite journal files: ${destination}`,
+      "backup",
+    );
+  }
+
+  let entry: fs.Stats | undefined;
+  try {
+    entry = fs.lstatSync(destination);
+  } catch {
+    entry = undefined;
+  }
+  if (entry !== undefined) {
+    if (entry.isDirectory()) {
+      throw new BorrowDeskError("INVALID_OUTPUT_PATH", `Backup path is a directory: ${destination}`, "backup");
+    }
+    throw new BorrowDeskError("OUTPUT_EXISTS", `${destination} already exists; choose another path`, "backup");
+  }
+}
+
+/**
+ * The `realpath` of the path's parent directory joined with its final component.
+ * The final component is not followed, so a symlink at the destination is not
+ * resolved to its target by this comparison.
+ */
+function resolveForComparison(target: string): string {
+  const parent = path.dirname(target);
+  let resolvedParent: string;
+  try {
+    resolvedParent = fs.realpathSync(parent);
+  } catch {
+    resolvedParent = path.resolve(parent);
+  }
+  return path.join(resolvedParent, path.basename(target));
+}
+
+/**
+ * Snapshots the source (the caller holds the write lock), stages it in a fresh
+ * temporary file, verifies it with a read-only connection and publishes it with
+ * a no-clobber hard link. Throws BACKUP_FAILED (or OUTPUT_EXISTS for the
+ * publication race) without publishing anything on any handled failure.
+ */
+function createBackup(db: Database.Database, destination: string, options: MigrateOptions): BackupInfo {
+  const directory = path.dirname(destination);
+  const tempPath = writeSnapshot(db, destination);
+  try {
+    options.onBackupStaged?.(tempPath);
+    verifyBackup(db, tempPath);
+  } catch (error) {
+    throw backupFailure(error, removeFile(tempPath));
+  }
+
+  try {
+    fs.linkSync(tempPath, destination);
+  } catch (error) {
+    const leftover = removeFile(tempPath);
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      const conflict = new BorrowDeskError("OUTPUT_EXISTS", `${destination} already exists; choose another path`, "backup");
+      throw annotateError(conflict, { backup: null, ...(leftover === undefined ? {} : { leftover }) });
+    }
+    throw backupFailure(error, leftover);
+  }
+
+  removeFile(tempPath);
+  fsyncDirectory(directory);
+  return { path: destination, created: true, verified: true, schemaVersion: V0_SCHEMA_VERSION };
+}
+
+/** Writes a synchronous `serialize()` snapshot to a fresh exclusive temporary file. */
+function writeSnapshot(db: Database.Database, destination: string): string {
+  const directory = path.dirname(destination);
+  const basename = path.basename(destination);
+  const snapshot = db.serialize();
+  let tempPath: string | undefined;
+  try {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      tempPath = path.join(directory, `${basename}.${randomBytes(8).toString("hex")}.tmp`);
+      let handle: number;
+      try {
+        handle = fs.openSync(tempPath, "wx", 0o600);
+      } catch (error) {
+        tempPath = undefined;
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+        throw error;
+      }
+      try {
+        let offset = 0;
+        while (offset < snapshot.length) {
+          offset += fs.writeSync(handle, snapshot, offset, snapshot.length - offset);
+        }
+        fs.fsyncSync(handle);
+      } finally {
+        fs.closeSync(handle);
+      }
+      return tempPath;
+    }
+    throw new Error("Could not create a unique temporary backup file");
+  } catch (error) {
+    throw backupFailure(error, tempPath === undefined ? undefined : removeFile(tempPath));
+  }
+}
+
+interface BackupState {
+  schema: { type: string; name: string; tbl_name: string; sql: string | null }[];
+  items: unknown[];
+  loans: unknown[];
+  sequence: unknown[];
+}
+
+const BACKUP_SCHEMA_NAMES = ["items", "loans", "loans_one_active_per_item", "sqlite_sequence"] as const;
+
+function readBackupState(db: Database.Database): BackupState {
+  const schema = db
+    .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name IN (?, ?, ?, ?) ORDER BY name")
+    .all(...BACKUP_SCHEMA_NAMES) as BackupState["schema"];
+  const items = db.prepare("SELECT id, name FROM items ORDER BY id").all();
+  const loans = db.prepare("SELECT id, item_id, borrower_id, checked_out_at, returned_at FROM loans ORDER BY id").all();
+  const sequence = db.prepare("SELECT name, seq FROM sqlite_sequence ORDER BY name").all();
+  return { schema, items, loans, sequence };
+}
+
+/** R3.3 verification of the staged file against the source state under the write lock. */
+function verifyBackup(source: Database.Database, tempPath: string): void {
+  const expected = readBackupState(source);
+  let backup: Database.Database;
+  try {
+    backup = new Database(tempPath, { readonly: true, fileMustExist: true });
+  } catch (error) {
+    throw new BorrowDeskError("BACKUP_FAILED", `Backup verification could not open the staged file: ${errorMessage(error)}`);
+  }
+  try {
+    const applicationId = backup.pragma("application_id", { simple: true }) as number;
+    const version = backup.pragma("user_version", { simple: true }) as number;
+    if (applicationId !== APPLICATION_ID || version !== V0_SCHEMA_VERSION) {
+      throw new BorrowDeskError("BACKUP_FAILED", "Backup verification failed: unexpected application id or schema version");
+    }
+    const integrity = backup.pragma("integrity_check");
+    const healthy =
+      Array.isArray(integrity) &&
+      integrity.length === 1 &&
+      Object.values((integrity[0] ?? {}) as object).includes("ok");
+    if (!healthy) {
+      throw new BorrowDeskError("BACKUP_FAILED", "Backup verification failed: integrity check did not report ok");
+    }
+    if (!isDeepStrictEqual(expected, readBackupState(backup))) {
+      throw new BorrowDeskError("BACKUP_FAILED", "Backup verification failed: the staged backup does not match the source");
+    }
+  } finally {
+    backup.close();
+  }
+}
+
+/** Wraps any backup-step failure as BACKUP_FAILED (exit 1), keeping a known code. */
+function backupFailure(error: unknown, leftover: string | undefined): BorrowDeskError {
+  const failure =
+    error instanceof BorrowDeskError && error.code === "BACKUP_FAILED"
+      ? error
+      : new BorrowDeskError("BACKUP_FAILED", `Backup failed: ${errorMessage(error)}`);
+  return annotateError(failure, { backup: null, ...(leftover === undefined ? {} : { leftover }) });
+}
+
+/** Removes a temporary file; returns its path when it could not be removed. */
+function removeFile(target: string): string | undefined {
+  try {
+    fs.unlinkSync(target);
+    return undefined;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : target;
+  }
+}
+
+/** Best-effort directory fsync; documented expectation, not a tested guarantee. */
+function fsyncDirectory(directory: string): void {
+  let handle: number | undefined;
+  try {
+    handle = fs.openSync(directory, "r");
+    fs.fsyncSync(handle);
+  } catch {
+    // Directory fsync is an expectation of this host, not something tests observe.
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle);
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export class BorrowDesk {

@@ -1,0 +1,10 @@
+{
+  "artifacts": {
+    "specs/BD-MIGRATION-BACKUP-1/requirements.md": {
+      "content_sha256": "08fb357f244a0bfd491ca19c8219806d2f66acfff4c72b1085067e0bf3950eef",
+      "depends_on": {},
+      "review_purpose": "proposal-reflection"
+    }
+  },
+  "format": "proofbound-freeze-v1"
+}

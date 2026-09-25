@@ -4,7 +4,7 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import Database from "better-sqlite3";
 import { renderDashboard } from "./dashboard.js";
-import { BorrowDesk, initializeDatabase, migrateDatabase } from "./desk.js";
+import { BorrowDesk, initializeDatabase, migrateDatabase, type BackupInfo } from "./desk.js";
 import { BorrowDeskError, type ErrorCode } from "./errors.js";
 import { parseLoanId } from "./validation.js";
 
@@ -15,7 +15,8 @@ Usage:
 
 Commands:
   init                               Create the current schema (safe to repeat; never migrates)
-  migrate                            Upgrade a v0 database to the current schema (atomic)
+  migrate [--backup <path>]          Upgrade a v0 database to the current schema (atomic);
+                                     --backup publishes a verified v0 backup first
   add-item <item-id> <name>          Register an equipment item
   list-items                         List items with availability, ordered by id
   hold <item-id>                     Place a maintenance hold on an item
@@ -27,8 +28,10 @@ Commands:
                                      (refuses to replace an existing file without --force)
 
 Options:
-  --db <path>   SQLite database file (required). Only init creates it.
-  -h, --help    Show this help
+  --db <path>      SQLite database file (required). Only init creates it.
+  --backup <path>  migrate only: publish a verified pre-migration v0 backup here
+                   (an existing destination is never overwritten).
+  -h, --help       Show this help
 
 A held item cannot be checked out; holds and loans are independent, so an item
 can be held while it is on loan. Ordinary commands refuse a v0 database with
@@ -44,12 +47,12 @@ Exit codes: 0 success, 2 invalid input or rejected operation, 1 unexpected failu
 
 interface CommandSpec {
   args: readonly string[];
-  options: readonly ("active" | "out" | "force")[];
+  options: readonly ("active" | "out" | "force" | "backup")[];
 }
 
 const COMMANDS: Record<string, CommandSpec> = {
   init: { args: [], options: [] },
-  migrate: { args: [], options: [] },
+  migrate: { args: [], options: ["backup"] },
   "add-item": { args: ["item-id", "name"], options: [] },
   "list-items": { args: [], options: [] },
   hold: { args: ["item-id"], options: [] },
@@ -67,6 +70,7 @@ interface ParsedCommand {
   active: boolean;
   out: string | undefined;
   force: boolean;
+  backup: string | undefined;
 }
 
 function usageError(message: string): BorrowDeskError {
@@ -82,6 +86,7 @@ function parse(argv: string[], onCommand: (command: string) => void): ParsedComm
       active: { type: "boolean" },
       out: { type: "string" },
       force: { type: "boolean" },
+      backup: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
     allowPositionals: true,
@@ -98,7 +103,7 @@ function parse(argv: string[], onCommand: (command: string) => void): ParsedComm
     const expected = spec.args.map((name) => `<${name}>`).join(" ");
     throw usageError(`Usage: ${command}${expected ? ` ${expected}` : ""}`);
   }
-  for (const option of ["active", "out", "force"] as const) {
+  for (const option of ["active", "out", "force", "backup"] as const) {
     if (values[option] !== undefined && !spec.options.includes(option)) {
       throw usageError(`Option --${option} is not valid for ${command}`);
     }
@@ -106,6 +111,9 @@ function parse(argv: string[], onCommand: (command: string) => void): ParsedComm
   if (values.db === undefined || values.db === "") throw usageError("Missing required option --db <path>");
   if (command === "report" && (values.out === undefined || values.out === "")) {
     throw usageError("Missing required option --out <file>");
+  }
+  if (values.backup !== undefined && values.backup === "") {
+    throw usageError("Option --backup requires a non-empty path");
   }
 
   return {
@@ -115,12 +123,15 @@ function parse(argv: string[], onCommand: (command: string) => void): ParsedComm
     active: values.active ?? false,
     out: values.out,
     force: values.force ?? false,
+    backup: values.backup,
   };
 }
 
 function execute(parsed: ParsedCommand): unknown {
   if (parsed.command === "init") return initializeDatabase(parsed.db);
-  if (parsed.command === "migrate") return migrateDatabase(parsed.db);
+  if (parsed.command === "migrate") {
+    return migrateDatabase(parsed.db, parsed.backup === undefined ? {} : { backup: parsed.backup });
+  }
 
   const desk = BorrowDesk.open(parsed.db);
   try {
@@ -197,10 +208,23 @@ interface Failure {
   code: ErrorCode;
   message: string;
   field?: string;
+  backup?: BackupInfo | null;
+  leftover?: string;
   exitCode: 1 | 2;
 }
 
+/** Adds additive annotations (`backup`, `leftover`) carried on the thrown error. */
 function describeFailure(error: unknown): Failure {
+  const failure = classifyFailure(error);
+  if (error !== null && typeof error === "object") {
+    const annotated = error as { backup?: BackupInfo | null; leftover?: string };
+    if (annotated.backup !== undefined) failure.backup = annotated.backup;
+    if (annotated.leftover !== undefined) failure.leftover = annotated.leftover;
+  }
+  return failure;
+}
+
+function classifyFailure(error: unknown): Failure {
   if (error instanceof BorrowDeskError) {
     return {
       code: error.code,
@@ -225,17 +249,20 @@ function describeFailure(error: unknown): Failure {
 
 function main(argv: string[]): number {
   let command: string | null = null;
+  let backupRequested = false;
   try {
     const parsed = parse(argv, (name) => (command = name));
     if (parsed === "help") {
       process.stdout.write(HELP);
       return 0;
     }
+    backupRequested = parsed.command === "migrate" && parsed.backup !== undefined;
     const data = execute(parsed);
     process.stdout.write(`${JSON.stringify({ ok: true, command, data }, null, 2)}\n`);
     return 0;
   } catch (error) {
     const { exitCode, ...details } = describeFailure(error);
+    if (backupRequested && details.backup === undefined) details.backup = null;
     process.stderr.write(`${JSON.stringify({ ok: false, command, error: details }, null, 2)}\n`);
     return exitCode;
   }
